@@ -1,0 +1,20 @@
+[package]
+name = "CompilerFwCtl"
+version = "0.1.0"
+edition = "2024"
+authors = ["daemon.devin"]
+description = "Portable Windows Firewall Control"
+license = "MIT"
+
+[build-dependencies]
+winresource = "0.1"
+
+[dependencies]
+clap = { version = "4.4", features = ["derive"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_NetworkManagement_WindowsFirewall",
+] }
