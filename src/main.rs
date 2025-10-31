@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use std::fmt;
+use std::mem;
 
 #[cfg(windows)]
 use windows::{
@@ -7,11 +8,12 @@ use windows::{
     Win32::System::Com::*,
     Win32::NetworkManagement::WindowsFirewall::*,
     Win32::Foundation::*,
+    Win32::System::Ole::*,
 };
 
 #[derive(Parser)]
 #[command(name = "CompilerFwCtl")]
-#[command(about = "A firewall control utility", long_about = None)]
+#[command(about = "A firewall control utility mimicking netsh advfirewall firewall", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -380,94 +382,51 @@ impl WindowsFirewallBackend {
             let rules = self.policy.Rules()?;
             let count = rules.Count()?;
             
-            let mut found_any = false;
-
-            for i in 1..=count {
-                let rule = rules.Item(&BSTR::from(i.to_string()))?;
-                let rule_name = rule.Name()?.to_string();
-                
-                // Filter by name if specified
-                if let Some(filter_name) = name {
-                    if rule_name != filter_name {
-                        continue;
+            if count == 0 {
+                println!("No rules match the specified criteria.");
+                return Ok(());
+            }
+            
+            // If filtering by name, try direct lookup first
+            if let Some(filter_name) = name {
+                // Try to get the rule directly by name
+                match rules.Item(&BSTR::from(filter_name)) {
+                    Ok(rule) => {
+                        self.print_rule(&rule, verbose)?;
+                        return Ok(());
+                    }
+                    Err(_) => {
+                        // Name lookup failed, fall through to enumeration
                     }
                 }
+            }
+            
+            // Use ForEach-style iteration through the collection
+            let mut found_any = false;
+            
+            // Try iterating using the collection directly
+            // We'll use IDispatch to call the Item property repeatedly
+            for i in 1..=count {
+                match rules.Item(&BSTR::from(i.to_string())) {
+                    Ok(rule) => {
+                        match rule.Name() {
+                            Ok(name_bstr) => {
+                                let rule_name = name_bstr.to_string();
+                                
+                                // Filter by name if specified (case-insensitive)
+                                if let Some(filter_name) = name {
+                                    if !rule_name.eq_ignore_ascii_case(filter_name) {
+                                        continue;
+                                    }
+                                }
 
-                found_any = true;
-
-                if verbose {
-                    let enabled = rule.Enabled()? == VARIANT_TRUE;
-                    let direction = match rule.Direction()? {
-                        NET_FW_RULE_DIR_IN => "Inbound",
-                        NET_FW_RULE_DIR_OUT => "Outbound",
-                        _ => "Unknown",
-                    };
-                    let action = match rule.Action()? {
-                        NET_FW_ACTION_ALLOW => "Allow",
-                        NET_FW_ACTION_BLOCK => "Block",
-                        _ => "Unknown",
-                    };
-                    
-                    let protocol_num = rule.Protocol()?;
-                    let protocol = match protocol_num {
-                        6 => "TCP".to_string(),
-                        17 => "UDP".to_string(),
-                        1 => "ICMPv4".to_string(),
-                        58 => "ICMPv6".to_string(),
-                        256 => "Any".to_string(),
-                        _ => protocol_num.to_string(),
-                    };
-
-                    let local_ports = rule.LocalPorts().map(|b| b.to_string()).unwrap_or_else(|_| "Any".to_string());
-                    let remote_ports = rule.RemotePorts().map(|b| b.to_string()).unwrap_or_else(|_| "Any".to_string());
-                    let local_addrs = rule.LocalAddresses().map(|b| b.to_string()).unwrap_or_else(|_| "Any".to_string());
-                    let remote_addrs = rule.RemoteAddresses().map(|b| b.to_string()).unwrap_or_else(|_| "Any".to_string());
-                    let app_name = rule.ApplicationName().map(|b| b.to_string()).unwrap_or_else(|_| "Any".to_string());
-                    let service_name = rule.ServiceName().map(|b| b.to_string()).unwrap_or_else(|_| "Any".to_string());
-                    let description = rule.Description().map(|b| b.to_string()).unwrap_or_else(|_| "".to_string());
-
-                    let profiles = rule.Profiles()?;
-                    let profile_str = match profiles {
-                        p if p == NET_FW_PROFILE2_ALL.0 => "All",
-                        p if p == NET_FW_PROFILE2_DOMAIN.0 => "Domain",
-                        p if p == NET_FW_PROFILE2_PRIVATE.0 => "Private",
-                        p if p == NET_FW_PROFILE2_PUBLIC.0 => "Public",
-                        _ => "Custom",
-                    };
-
-                    println!("Rule Name:            {}", rule_name);
-                    println!("Enabled:              {}", if enabled { "Yes" } else { "No" });
-                    println!("Direction:            {}", direction);
-                    println!("Action:               {}", action);
-                    println!("Protocol:             {}", protocol);
-                    println!("Local Port:           {}", local_ports);
-                    println!("Remote Port:          {}", remote_ports);
-                    println!("Local IP:             {}", local_addrs);
-                    println!("Remote IP:            {}", remote_addrs);
-                    println!("Program:              {}", app_name);
-                    println!("Service:              {}", service_name);
-                    println!("Profile:              {}", profile_str);
-                    println!("Description:          {}", description);
-                    println!();
-                } else {
-                    let enabled = rule.Enabled()? == VARIANT_TRUE;
-                    let direction = match rule.Direction()? {
-                        NET_FW_RULE_DIR_IN => "In",
-                        NET_FW_RULE_DIR_OUT => "Out",
-                        _ => "?",
-                    };
-                    let action = match rule.Action()? {
-                        NET_FW_ACTION_ALLOW => "Allow",
-                        NET_FW_ACTION_BLOCK => "Block",
-                        _ => "?",
-                    };
-
-                    println!("{:<50} {:<10} {:<10} {:<10}", 
-                        if rule_name.len() > 50 { format!("{}...", &rule_name[..47]) } else { rule_name },
-                        direction,
-                        action,
-                        if enabled { "Yes" } else { "No" }
-                    );
+                                found_any = true;
+                                self.print_rule(&rule, verbose)?;
+                            }
+                            Err(_) => continue,
+                        }
+                    }
+                    Err(_) => continue,
                 }
             }
 
@@ -475,6 +434,89 @@ impl WindowsFirewallBackend {
                 println!("No rules match the specified criteria.");
             }
 
+            Ok(())
+        }
+    }
+
+    fn print_rule(&self, rule: &INetFwRule, verbose: bool) -> StdResult<()> {
+        unsafe {
+            let rule_name = rule.Name()?.to_string();
+            
+            if verbose {
+                let enabled = rule.Enabled().unwrap_or(VARIANT_FALSE) == VARIANT_TRUE;
+                let direction = match rule.Direction() {
+                    Ok(NET_FW_RULE_DIR_IN) => "Inbound",
+                    Ok(NET_FW_RULE_DIR_OUT) => "Outbound",
+                    _ => "Unknown",
+                };
+                let action = match rule.Action() {
+                    Ok(NET_FW_ACTION_ALLOW) => "Allow",
+                    Ok(NET_FW_ACTION_BLOCK) => "Block",
+                    _ => "Unknown",
+                };
+                
+                let protocol_num = rule.Protocol().unwrap_or(256);
+                let protocol = match protocol_num {
+                    6 => "TCP".to_string(),
+                    17 => "UDP".to_string(),
+                    1 => "ICMPv4".to_string(),
+                    58 => "ICMPv6".to_string(),
+                    256 => "Any".to_string(),
+                    _ => protocol_num.to_string(),
+                };
+
+                let local_ports = rule.LocalPorts().map(|b| b.to_string()).unwrap_or_else(|_| "Any".to_string());
+                let remote_ports = rule.RemotePorts().map(|b| b.to_string()).unwrap_or_else(|_| "Any".to_string());
+                let local_addrs = rule.LocalAddresses().map(|b| b.to_string()).unwrap_or_else(|_| "Any".to_string());
+                let remote_addrs = rule.RemoteAddresses().map(|b| b.to_string()).unwrap_or_else(|_| "Any".to_string());
+                let app_name = rule.ApplicationName().map(|b| b.to_string()).unwrap_or_else(|_| "Any".to_string());
+                let service_name = rule.ServiceName().map(|b| b.to_string()).unwrap_or_else(|_| "Any".to_string());
+                let description = rule.Description().map(|b| b.to_string()).unwrap_or_else(|_| "".to_string());
+
+                let profiles = rule.Profiles().unwrap_or(NET_FW_PROFILE2_ALL.0);
+                let profile_str = match profiles {
+                    p if p == NET_FW_PROFILE2_ALL.0 => "All",
+                    p if p == NET_FW_PROFILE2_DOMAIN.0 => "Domain",
+                    p if p == NET_FW_PROFILE2_PRIVATE.0 => "Private",
+                    p if p == NET_FW_PROFILE2_PUBLIC.0 => "Public",
+                    _ => "Custom",
+                };
+
+                println!("Rule Name:            {}", rule_name);
+                println!("Enabled:              {}", if enabled { "Yes" } else { "No" });
+                println!("Direction:            {}", direction);
+                println!("Action:               {}", action);
+                println!("Protocol:             {}", protocol);
+                println!("Local Port:           {}", local_ports);
+                println!("Remote Port:          {}", remote_ports);
+                println!("Local IP:             {}", local_addrs);
+                println!("Remote IP:            {}", remote_addrs);
+                println!("Program:              {}", app_name);
+                println!("Service:              {}", service_name);
+                println!("Profile:              {}", profile_str);
+                println!("Description:          {}", description);
+                println!();
+            } else {
+                let enabled = rule.Enabled().unwrap_or(VARIANT_FALSE) == VARIANT_TRUE;
+                let direction = match rule.Direction() {
+                    Ok(NET_FW_RULE_DIR_IN) => "In",
+                    Ok(NET_FW_RULE_DIR_OUT) => "Out",
+                    _ => "?",
+                };
+                let action = match rule.Action() {
+                    Ok(NET_FW_ACTION_ALLOW) => "Allow",
+                    Ok(NET_FW_ACTION_BLOCK) => "Block",
+                    _ => "?",
+                };
+
+                println!("{:<50} {:<10} {:<10} {:<10}", 
+                    if rule_name.len() > 50 { format!("{}...", &rule_name[..47]) } else { rule_name },
+                    direction,
+                    action,
+                    if enabled { "Yes" } else { "No" }
+                );
+            }
+            
             Ok(())
         }
     }
@@ -586,5 +628,3 @@ fn main() -> StdResult<()> {
 
     Ok(())
 }
-
-// ] }
